@@ -1,0 +1,136 @@
+ap-recovery/
+├── app.py
+├── requirements.txt
+├── README.md
+└── utils/
+    ├── ap_logic.py
+    ├── servicenow.py
+    └── wlc_utils.py
+
+app.py
+from flask import Flask, request
+from utils.ap_logic import recover_ap_9800
+
+app = Flask(__name__)
+
+@app.route('/ap_down_alert', methods=['POST'])
+def handle_alert():
+    data = request.json
+    ap_name = data.get('ap_name')
+    wlc_ip = data.get('wlc_ip')
+    controller_name = data.get('controller_name', 'WLC-PROD1')
+    site_id = data.get('site_id', 'UNKNOWN')
+
+    result = recover_ap_9800(
+        ap_name=ap_name,
+        wlc_ip=wlc_ip,
+        username='admin',
+        password='YourPasswordHere',
+        controller_name=controller_name,
+        site_id=site_id
+    )
+    return {"result": result}, 200
+
+if __name__ == '__main__':
+    app.run(port=5001)
+
+requirements.txt
+flask
+netmiko
+requests
+
+README.md
+# Downed AP Auto-Recovery (Catalyst 9800)
+
+## Overview
+Self-healing automation for stuck or downed APs on 9800 WLC.
+
+## Setup
+1. Modify credentials in `app.py` and `utils/servicenow.py`.
+2. Install dependencies: `pip install -r requirements.txt`.
+3. Start app: `python app.py`.
+
+## POST Alert Example
+```json
+{
+  "ap_name": "AP-1234",
+  "wlc_ip": "10.1.1.5",
+  "controller_name": "WLC-PROD1",
+  "site_id": "SITE-001"
+}
+
+ ---
+
+### 📂 `utils/wlc_utils.py`
+
+```python
+from netmiko import ConnectHandler
+
+def connect_to_wlc(wlc_ip, username, password):
+    return ConnectHandler(device_type='cisco_xe', host=wlc_ip,
+                          username=username, password=password)
+
+def get_ap_status(net_connect, ap_name):
+    output = net_connect.send_command(f"show ap name {ap_name} config general")
+    if "not found" in output.lower():
+        return "NOT_FOUND"
+    if "Downloading" in output:
+        return "DOWNLOADING"
+    if "Not Joined" in output:
+        return "NOT_JOINED"
+    if "Joined" in output:
+        return "JOINED"
+    return "UNKNOWN"
+
+def reset_ap(net_connect, ap_name):
+    return net_connect.send_command(f"ap name {ap_name} reset")
+
+def cancel_ap_download(net_connect, ap_name):
+    return net_connect.send_command(f"ap name {ap_name} image abort")
+
+def rebind_ap(net_connect, ap_name, controller_name):
+    return net_connect.send_command(f"ap name {ap_name} capwap primary-base {controller_name}")
+
+utils/servicenow.py
+import requests
+
+def log_ticket_servicenow(ap_name, wlc_ip, site_id):
+    url = "https://your_instance.service-now.com/api/now/table/incident"
+    auth = ("api_user", "api_password")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    payload = {
+        "short_description": f"AP {ap_name} not found on WLC {wlc_ip}",
+        "description": f"AP {ap_name} couldn’t be located on WLC {wlc_ip} (site {site_id}). Recovery aborted.",
+        "category": "network",
+        "subcategory": "wireless",
+        "assignment_group": "Wireless Ops",
+        "priority": "2"
+    }
+    r = requests.post(url, auth=auth, headers=headers, json=payload)
+    return "✅ Ticket created" if r.status_code == 201 else f"❌ {r.text}"utils/ap_logic.pyutils/ap_logic.py
+
+utils/ap_logic.py
+from .wlc_utils import *
+from .servicenow import log_ticket_servicenow
+
+def recover_ap_9800(ap_name, wlc_ip, username, password, controller_name=None, site_id="UNKNOWN"):
+    try:
+        net_connect = connect_to_wlc(wlc_ip, username, password)
+        status = get_ap_status(net_connect, ap_name)
+        if status == "NOT_FOUND":
+            return log_ticket_servicenow(ap_name, wlc_ip, site_id)
+        elif status == "DOWNLOADING":
+            cancel_ap_download(net_connect, ap_name)
+            reset_ap(net_connect, ap_name)
+            return f"🔁 Reset AP {ap_name} stuck in download"
+        elif status == "NOT_JOINED":
+            if controller_name:
+                rebind_ap(net_connect, ap_name, controller_name)
+            reset_ap(net_connect, ap_name)
+            return f"🧭 Rebound & reset AP {ap_name}"
+        elif status == "JOINED":
+            return f"✅ AP {ap_name} is healthy"
+        else:
+            return f"⚠️ Unknown state for AP {ap_name}"
+    except Exception as e:
+        return f"❌ Failed recovery for {ap_name}: {e}"
